@@ -683,6 +683,46 @@ LSTM_RELOAD_INTERVAL_SECS = float(os.getenv("LSTM_RELOAD_INTERVAL_SECS", str(2 *
 LSTM_MIN_TICK_RETURNS_FOR_SIGNAL   = 30
 LSTM_MIN_MINUTE_RETURNS_FOR_SIGNAL = 30
 
+# ── v16: CONTRACT EXPIRY UNIT ──────────────────────────────────────────────
+# TRADE_UNIT picks which expiry the whole bot trades: "t" = ticks (default),
+# "m" = minutes (the old v10 behaviour). One switch drives the data view the
+# gates run on (raw ticks vs resampled minute bars), which fitted models are
+# used (model_cache vs minute_model_cache), the candidate duration grid, which
+# LSTM model gates the trade, the Deriv duration_unit sent on buy, and the
+# settle timeout. There is still NO cross-unit fallback: if nothing qualifies
+# in the configured unit this cycle, the bot waits.
+#
+# TRADE_DURATIONS_TICKS: tick counts the bot may pick from. Deriv's Rise/Fall
+# (CALL/PUT) contracts only accept 5-10 ticks, so the default grid is 5,7,10
+# rather than the old 1,3,5,7,10 -- 1 and 3 would be rejected by the API.
+TRADE_UNIT = os.getenv("TRADE_UNIT", "t").strip().lower()
+if TRADE_UNIT not in ("t", "m"):
+    raise ValueError(f"TRADE_UNIT must be 't' (ticks) or 'm' (minutes), got {TRADE_UNIT!r}")
+TRADE_DURATIONS_TICKS = [int(x) for x in
+                         os.getenv("TRADE_DURATIONS_TICKS", "5,7,10").split(",") if x.strip()]
+if not TRADE_DURATIONS_TICKS:
+    raise ValueError("TRADE_DURATIONS_TICKS must list at least one tick count")
+TRADE_DURATIONS   = TRADE_DURATIONS_TICKS if TRADE_UNIT == "t" else list(CANDIDATE_DURATIONS_MINUTES)
+TRADE_UNIT_LABEL  = "ticks" if TRADE_UNIT == "t" else "minutes"
+
+
+def trade_view(sd, max_bars=None):
+    """The data object the gate pipeline runs on for the configured expiry:
+    the raw tick SymbolData itself, or a resampled MinuteBarView."""
+    return sd if TRADE_UNIT == "t" else MinuteBarView(sd, max_bars=max_bars)
+
+
+def trade_view_ready(view) -> bool:
+    if TRADE_UNIT == "t":
+        return len(view.ticks) >= MIN_TICKS_LIVE
+    return view.has_data(60)
+
+
+def trade_models(state, symbol):
+    """Fitted per-symbol model stack matching the configured expiry."""
+    cache = state.model_cache if TRADE_UNIT == "t" else state.minute_model_cache
+    return cache.get(symbol)
+
 
 # ---------------------------------------------------------------------------
 # SUPABASE PERSISTENCE STORE
@@ -3948,7 +3988,8 @@ def lstm_evaluate(sd: "SymbolData") -> Optional[dict]:
     single most confident read this cycle. The caller (Gate 6 below)
     decides whether direction agreement is enough, or whether to also act
     on the minute-duration suggestion."""
-    if not LSTM_ENABLED or (_lstm_tick_model is None and _lstm_minute_model is None):
+    _active_lstm = _lstm_tick_model if TRADE_UNIT == "t" else _lstm_minute_model
+    if not LSTM_ENABLED or _active_lstm is None:
         return None
 
     tick_returns = sd.returns()
@@ -3959,6 +4000,12 @@ def lstm_evaluate(sd: "SymbolData") -> Optional[dict]:
     minute_window = (minute_returns
                       if len(minute_returns) >= LSTM_MIN_MINUTE_RETURNS_FOR_SIGNAL else None)
 
+    # v16: only the configured expiry's window is considered, so the pick
+    # (and Gate 6's direction veto) always comes from the matching model.
+    if TRADE_UNIT == "t":
+        minute_window = None
+    else:
+        tick_window = None
     if tick_window is None and minute_window is None:
         return None
 
@@ -3966,7 +4013,7 @@ def lstm_evaluate(sd: "SymbolData") -> Optional[dict]:
         return lstm_duration_scan(
             _lstm_tick_model, _lstm_minute_model,
             tick_window, minute_window,
-            tick_durations=CANDIDATE_DURATIONS_TICKS,
+            tick_durations=TRADE_DURATIONS_TICKS,
             minute_durations=CANDIDATE_DURATIONS_MINUTES,
             max_uncertainty=LSTM_MAX_UNCERTAINTY,
         )
@@ -4550,7 +4597,7 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
 
 
 async def execute_single_step(client, state, symbol, direction, stake, step, duration=5,
-                              duration_unit="m", feats=None):
+                              duration_unit=None, feats=None):
     """Places exactly ONE trade and returns. Never loops to the next martingale
     step — that decision belongs to the main signal loop, which waits for a
     genuine quality entry before placing any recovery step.
@@ -4565,6 +4612,8 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
     symbol, that FAILS this trade attempt cleanly (logged, no contract
     placed) rather than silently downgrading to a tick contract -- there
     is no tick fallback anywhere in this bot anymore, by design."""
+    if duration_unit is None:
+        duration_unit = TRADE_UNIT
     # ── Atomic final gate check ─────────────────────────────────────────────
     if feats is not None:
         gate_ok, n_agree, n_dis, _ = passes_layer_gate(feats, direction)
@@ -5067,7 +5116,7 @@ async def deep_startup_calibration(state, symbol_data, symbols):
             # history yet -- that symbol just falls back to tick-native
             # gates until a later calibration cycle has more minute bars
             # buffered.
-            minute_m = fit_minute_models_for_symbol(sd)
+            minute_m = fit_minute_models_for_symbol(sd) if TRADE_UNIT == "m" else None
             if minute_m is not None:
                 state.minute_model_cache[s] = minute_m
                 print(f"  Minute model      : fitted ({len(sd.minute_bar_prices())} bars)")
@@ -5293,7 +5342,7 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
             # calibration -- keeps the minute-native gate pipeline's
             # models fresh on every recalibration cycle too, not just at
             # startup.
-            minute_m = fit_minute_models_for_symbol(sd)
+            minute_m = fit_minute_models_for_symbol(sd) if TRADE_UNIT == "m" else None
             if minute_m is not None:
                 state.minute_model_cache[s] = minute_m
             else:
@@ -5569,10 +5618,14 @@ async def main():
         # have an entry -- copula_agreement() already tolerates a
         # smaller cross-symbol set.
         minute_returns_window_dict = {}
-        for s in ready_symbols:
+        for s in (ready_symbols if TRADE_UNIT == "m" else []):   # v16: skip in tick mode
             mv_s = MinuteBarView(symbol_data[s], max_bars=201)
             if mv_s.has_data(30):
                 minute_returns_window_dict[s] = mv_s.returns()[-200:]
+        # v16: the returns-window dict the active expiry's gate pipeline uses
+        # for copula_agreement() inside compute_features().
+        trade_returns_window_dict = (minute_returns_window_dict if TRADE_UNIT == "m"
+                                     else returns_window_dict)
 
         # ── RECOVERY MODE ────────────────────────────────────────────────────
         # No symbol, direction, or duration lock on WHICH symbol EXECUTES a
@@ -5623,7 +5676,7 @@ async def main():
                 best_sym, best_cand = None, None
                 for s in ready_symbols:
                     cand = lstm_evaluate(symbol_data[s])
-                    if (cand is None or cand["duration_unit"] != "m"
+                    if (cand is None or cand["duration_unit"] != TRADE_UNIT
                             or cand["edge"] < LSTM_MIN_EDGE_STANDALONE):
                         continue
                     if best_cand is None or cand["edge"] > best_cand["edge"]:
@@ -5633,10 +5686,10 @@ async def main():
                 # Minute-native feats for explain_signal()'s display, when
                 # available -- falls back to tick feats only for logging
                 # purposes (Gates 1-5 never gate this trade either way).
-                mv_l = MinuteBarView(symbol_data[best_sym])
-                m_models_l = state.minute_model_cache.get(best_sym)
-                if mv_l.has_data(60) and m_models_l is not None:
-                    feats_l = compute_features(mv_l, m_models_l, minute_returns_window_dict)
+                mv_l = trade_view(symbol_data[best_sym])
+                m_models_l = trade_models(state, best_sym)
+                if trade_view_ready(mv_l) and m_models_l is not None:
+                    feats_l = compute_features(mv_l, m_models_l, trade_returns_window_dict)
                 else:
                     feats_l = compute_features(symbol_data[best_sym], state.model_cache.get(best_sym),
                                                returns_window_dict)
@@ -5646,7 +5699,7 @@ async def main():
                     "confidence": min(1.0, best_cand["edge"] * 2.0),
                     "exp_win_rate": best_cand["p"], "rating": best_cand["edge"],
                     "duration": best_cand["duration"],
-                    "exec_duration": best_cand["duration"], "duration_unit": "m",
+                    "exec_duration": best_cand["duration"], "duration_unit": TRADE_UNIT,
                     "feats": feats_l, "n_agree": None,
                 }
 
@@ -5661,14 +5714,14 @@ async def main():
                 best = None
                 for rs in ready_symbols:
                     sd_m = symbol_data[rs]
-                    mv = MinuteBarView(sd_m)
-                    if not mv.has_data(60):
+                    mv = trade_view(sd_m)
+                    if not trade_view_ready(mv):
                         continue
-                    m_models = state.minute_model_cache.get(rs)
+                    m_models = trade_models(state, rs)
                     if m_models is None:
                         continue
 
-                    feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                    feats_m = compute_features(mv, m_models, trade_returns_window_dict)
                     if feats_m is None:
                         continue
                     p_up_m, confidence_m = fuse_signal(feats_m, state, rs)
@@ -5677,7 +5730,7 @@ async def main():
 
                     mc_duration_m, exp_win_rate_m = monte_carlo_duration(
                         mv.prices(), minute_returns, direction_m, feats_m,
-                        CANDIDATE_DURATIONS_MINUTES, models=m_models
+                        TRADE_DURATIONS, models=m_models
                     )
                     if exp_win_rate_m < MIN_EXP_WIN_RATE:
                         # v15 BUGFIX: this was a completely silent reject --
@@ -5708,7 +5761,7 @@ async def main():
                         tf_agree, _ = multi_timeframe_confluence(mv.prices(), direction_m)
                         if tf_agree < MIN_TF_AGREEMENT:
                             continue
-                        mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                        mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, TRADE_DURATIONS,
                                                  hmm_model=getattr(m_models, "hmm_model", None))
                         sym_score_m = confidence_m * state.reliability.get(rs, 1.0)
                         sym_thr_m   = state.per_symbol_threshold.get(rs, state.adaptive_threshold)
@@ -5722,7 +5775,7 @@ async def main():
                                 "direction": direction_m, "p_up": float(p_up_m),
                                 "confidence": float(confidence_m), "exp_win_rate": float(exp_win_rate_m),
                                 "rating": rating, "duration": mc_duration_m,
-                                "exec_duration": mc_duration_m, "duration_unit": "m",
+                                "exec_duration": mc_duration_m, "duration_unit": TRADE_UNIT,
                                 "feats": feats_m, "n_agree": None,
                             }
                         continue
@@ -5741,7 +5794,7 @@ async def main():
                     if not bs_agrees:
                         continue
 
-                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, TRADE_DURATIONS,
                                              hmm_model=getattr(m_models, "hmm_model", None))
                     sym_score_m = confidence_m * state.reliability.get(rs, 1.0)
                     sym_thr_m   = state.per_symbol_threshold.get(rs, state.adaptive_threshold)
@@ -5760,7 +5813,7 @@ async def main():
                             "direction": direction_m, "p_up": float(p_up_m),
                             "confidence": float(confidence_m), "exp_win_rate": float(exp_win_rate_m),
                             "rating": rating, "duration": mc_duration_m,
-                            "exec_duration": mc_duration_m, "duration_unit": "m",
+                            "exec_duration": mc_duration_m, "duration_unit": TRADE_UNIT,
                             "feats": feats_m, "n_agree": n_agree,
                         }
                 return best
@@ -5827,11 +5880,11 @@ async def main():
                               f"ensemble's read moved between scan and fire.")
                     atomic_feats = None
                 elif recovery_source == "minute_gates":
-                    mv_atomic = MinuteBarView(symbol_data[rec_sym])
-                    m_models_atomic = state.minute_model_cache.get(rec_sym)
+                    mv_atomic = trade_view(symbol_data[rec_sym])
+                    m_models_atomic = trade_models(state, rec_sym)
                     feats_minute_atomic = (
-                        compute_features(mv_atomic, m_models_atomic, minute_returns_window_dict)
-                        if m_models_atomic is not None and mv_atomic.has_data(60) else None)
+                        compute_features(mv_atomic, m_models_atomic, trade_returns_window_dict)
+                        if m_models_atomic is not None and trade_view_ready(mv_atomic) else None)
                     atomic_ok = (feats_minute_atomic is not None
                                 and passes_layer_gate(feats_minute_atomic, rec_dir)[0])
                     if not atomic_ok:
@@ -5999,14 +6052,14 @@ async def main():
                 ready yet for this symbol or any gate rejects it -- either
                 way the caller falls through to the LSTM-standalone /
                 tick-gate fallback logic below, unchanged from before."""
-                mv = MinuteBarView(sd)
-                if not mv.has_data(60):
+                mv = trade_view(sd)
+                if not trade_view_ready(mv):
                     return None
-                m_models = state.minute_model_cache.get(s)
+                m_models = trade_models(state, s)
                 if m_models is None:
                     return None
 
-                feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                feats_m = compute_features(mv, m_models, trade_returns_window_dict)
                 if feats_m is None:
                     return None
                 feats_m["recent_call_ratio"] = recent_call_ratio
@@ -6085,7 +6138,7 @@ async def main():
 
                 mc_duration_m, exp_win_rate_m = monte_carlo_duration(
                     mv.prices(), minute_returns, direction_m, feats_m,
-                    CANDIDATE_DURATIONS_MINUTES, models=m_models
+                    TRADE_DURATIONS, models=m_models
                 )
                 if exp_win_rate_m < MIN_EXP_WIN_RATE:
                     # v15 BUGFIX: completely silent reject -- every other
@@ -6142,7 +6195,7 @@ async def main():
                     # otherwise it's diagnostic-only (see the v5/v6 version
                     # notes at the top of this file for why a hard
                     # required-agreement version over-rejected).
-                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, TRADE_DURATIONS,
                                              hmm_model=getattr(m_models, "hmm_model", None))
                     sym_score_m = confidence_m * state.reliability.get(s, 1.0)
                     sym_thr_m   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
@@ -6165,7 +6218,7 @@ async def main():
                         "rating": abs(float(p_up_m) - 0.5),
                         "duration": mc_duration_m,
                         "exec_duration": mc_duration_m,
-                        "duration_unit": "m",
+                        "duration_unit": TRADE_UNIT,
                         "regime": regime_res["regime"] if regime_res else None,
                         "conviction": regime_res["conviction"] if regime_res else None,
                         "conviction_stake": regime_res["stake"] if regime_res else None,
@@ -6218,7 +6271,7 @@ async def main():
                     return None
 
                 # Gate 5: advanced HMM/GBM Monte Carlo, minute-scale
-                mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, TRADE_DURATIONS,
                                          hmm_model=getattr(m_models, "hmm_model", None))
                 sym_score_m = confidence_m * state.reliability.get(s, 1.0)
                 sym_thr_m   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
@@ -6263,7 +6316,7 @@ async def main():
                     "rating": abs(float(p_up_m) - 0.5),
                     "duration": mc_duration_m,
                     "exec_duration": mc_duration_m,
-                    "duration_unit": "m",
+                    "duration_unit": TRADE_UNIT,
                     # Regime-routing outputs. conviction_stake is what the
                     # execution path should actually stake — it is the whole
                     # point of the asymmetric-sizing half of this change.
@@ -6296,7 +6349,7 @@ async def main():
                 # simply not a qualifying candidate, full stop.
                 lstm_standalone = lstm_evaluate(sd)
                 if (lstm_standalone is not None
-                        and lstm_standalone["duration_unit"] == "m"
+                        and lstm_standalone["duration_unit"] == TRADE_UNIT
                         and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE):
                     chosen = {
                         "source": "lstm_standalone",
@@ -6307,7 +6360,7 @@ async def main():
                         "rating": lstm_standalone["edge"],
                         "duration": lstm_standalone["duration"],
                         "exec_duration": lstm_standalone["duration"],
-                        "duration_unit": "m",
+                        "duration_unit": TRADE_UNIT,
                     }
                     print(f"[LSTM] {s}: minute-priority pick clears the bar on its own "
                           f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
@@ -6417,11 +6470,11 @@ async def main():
                     return
                 atomic_feats = None
             elif source == "minute_gates":
-                mv_atomic = MinuteBarView(sd)
-                m_models_atomic = state.minute_model_cache.get(symbol)
-                if m_models_atomic is not None and mv_atomic.has_data(60):
+                mv_atomic = trade_view(sd)
+                m_models_atomic = trade_models(state, symbol)
+                if m_models_atomic is not None and trade_view_ready(mv_atomic):
                     feats_minute_atomic = await asyncio.to_thread(
-                        compute_features, mv_atomic, m_models_atomic, minute_returns_window_dict
+                        compute_features, mv_atomic, m_models_atomic, trade_returns_window_dict
                     )
                 else:
                     feats_minute_atomic = None
@@ -6462,7 +6515,7 @@ async def main():
             # unconditionally for every candidate that reaches
             # portfolio_candidates (see the scan loop above).
             exec_duration = lstm_minute_overrides.get(symbol, duration)
-            exec_unit     = "m"
+            exec_unit     = TRADE_UNIT
 
             # v15 BUGFIX: reset_sequence_accumulator/state.seq_* are now
             # keyed by symbol (see TradeState.seq_stakes for the incident
